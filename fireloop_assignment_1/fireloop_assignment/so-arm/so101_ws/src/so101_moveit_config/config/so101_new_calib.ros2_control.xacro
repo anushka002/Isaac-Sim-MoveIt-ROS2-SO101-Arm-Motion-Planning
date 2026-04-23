@@ -6,6 +6,16 @@
         <ros2_control name="${name}" type="system">
             <hardware>
                 <xacro:if value="${use_fake_hardware}">
+                    <!-- <plugin>mock_components/GenericSystem</plugin> -->
+                    <!-- <plugin>topic_based_ros2_control/TopicBasedSystem</plugin>
+                    <param name="joint_states_topic">/isaac_joint_states</param>
+                    <param name="joint_commands_topic">/isaac_joint_command</param> -->
+                    <!-- <plugin>joint_state_topic_hardware_interface/JointStateTopicSystem</plugin>
+                    <param name="joint_states_topic">/isaac_joint_states</param>
+                    <param name="joint_commands_topic">/isaac_joint_command</param>
+                    <param name="sum_wrapped_joint_states">true</param> -->
+
+                    <!-- MODIFY TO SETUP MOVEIT + ROS2 + ISAAC SIM -->
                     <plugin>topic_based_ros2_control/TopicBasedSystem</plugin>
                     <param name="joint_states_topic">/isaac_joint_states</param>
                     <param name="joint_commands_topic">/isaac_joint_command</param>

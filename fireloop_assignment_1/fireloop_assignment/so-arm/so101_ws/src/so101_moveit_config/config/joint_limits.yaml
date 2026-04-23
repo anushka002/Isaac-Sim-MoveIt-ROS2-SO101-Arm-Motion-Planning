@@ -7,6 +7,9 @@ default_acceleration_scaling_factor: 0.2
 
 # Specific joint properties can be changed with the keys [max_position, min_position, max_velocity, max_acceleration]
 # Joint limits can be turned off with [has_velocity_limits, has_acceleration_limits]
+
+# ALL VALUES NEEDED IN FLOAT
+
 joint_limits:
   elbow_flex:
     has_velocity_limits: true

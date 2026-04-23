@@ -1,4 +1,6 @@
 from setuptools import find_packages, setup
+import os                          # ← ADD
+from glob import glob              # ← ADD
 
 package_name = 'so101_motion_planning'
 
@@ -10,6 +12,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),  # ← ADD
     ],
     install_requires=['setuptools'],
     zip_safe=True,

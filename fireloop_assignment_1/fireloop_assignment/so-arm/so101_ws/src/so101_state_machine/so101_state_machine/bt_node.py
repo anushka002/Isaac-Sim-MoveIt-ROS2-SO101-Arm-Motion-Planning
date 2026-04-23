@@ -2,28 +2,28 @@
 """
 SO101 Behaviour Tree Node
 =========================
-Implements the full pick-and-place sequence:
-  1. OpenGripper
-  2. Grabbing  (reads /red_cup_pose → pre-grasp → grasp → close gripper)
-  3. AttachCube        ← PROVIDED
-  4. MoveToBoxPosition (lift → move above box → descend → place)
-  5. DetachCube        ← PROVIDED
-  6. OpenGripper
+Implements the full pick-and-place sequence for the SO101 robotic arm.
 
-BT Concepts used here:
-  - Sequence: runs children in order, stops on first FAILURE
-  - Retry(n): retries child up to n times on FAILURE
-  - OneShot:  runs the tree once then stops forever
+Based on the provided template structure (OpenGripper / Grabbing /
+MoveToBoxPosition + provided AttachDetachCube leaves).
+
+Sequence:
+  1.  OpenGripper         → open gripper before moving
+  2.  Grabbing            → read /red_cup_pose, move above cup,
+                            descend, close gripper
+  3.  AttachCube          → Isaac FixedJoint ON  [PROVIDED]
+  4.  MoveToBoxPosition   → lift, transit to bin, descend, place
+  5.  DetachCube          → Isaac FixedJoint OFF [PROVIDED]
+  6.  OpenGripper         → release cup
+
+BT concepts used:
+  Sequence(memory=True)  — runs children in order, stops on FAILURE,
+                           remembers completed steps on retry
+  Retry(n)               — retries child up to n times on FAILURE
+  OneShot                — runs entire tree once then stops forever
 
 Each leaf uses a background thread for MoveIt calls so update()
-never blocks — it just checks a flag and returns RUNNING/SUCCESS/FAILURE.
-
-HOW THREADING WORKS HERE:
-  - initialise() is called once when the leaf first becomes active
-  - We start a background thread that runs the MoveIt call
-  - update() checks self._status every 0.1s tick
-  - When thread finishes it sets self._status to SUCCESS or FAILURE
-  - update() returns that status → BT moves to next leaf
+never blocks — it returns RUNNING until the thread sets _status.
 """
 
 import time
@@ -39,89 +39,86 @@ from so101_motion_planning.motion_planning_node import MotionPlanner
 
 
 # ─────────────────────────────────────────────────────────────
-# Scene coordinates (in base_link frame)
+# Scene coordinates — all in base_link frame
+# Tune these based on your Isaac Sim scene layout.
 # ─────────────────────────────────────────────────────────────
 
-# Box/bin position — from Isaac Sim xformOp:translate
-BOX_X = 0.20
-BOX_Y = -0.14
-BOX_Z = 0.06   # top of box — adjust if needed
+# Bin/box position from Isaac Sim xformOp:translate
+BIN_X = 0.2
+BIN_Y = -0.15
 
-# Grasp offset above cup — approach from above
-PRE_GRASP_Z_OFFSET = 0.15   # 15cm above cup centroid
-GRASP_Z_OFFSET     = 0.06   # 6cm above table (cup rim height)
+# Grasp approach heights (added to perceived cup z)
+Z_PRE_GRASP  = 0.22   # safe approach — above cup with gripper closed
+Z_GRASP      = 0.15   # descent height — gripper surrounds cup rim
 
-# Place offsets above box
-PRE_PLACE_Z_OFFSET = 0.20   # 20cm above box — safe transit height
-PLACE_Z_OFFSET     = 0.10   # 10cm above box — release height
+# Transit and placement heights (absolute in base_link)
+Z_LIFT       = 0.350   # straight up after grasp — clears table and bin
+Z_TRANSIT    = 0.350   # horizontal transit height to bin
+Z_ABOVE_BIN  = 0.25   # above bin before descent
+Z_PLACE      = 0.2   # release height inside bin
 
-# Fixed attach/detach topic
-ATTACH_TOPIC = "/isaac_attach_cube"   # NOTE: no /robot/ prefix
-ATTACH_DELAY = 0.5
+# Attach/detach
+ATTACH_TOPIC = "/isaac_attach_cube"
+ATTACH_DELAY = 0.5    # seconds to wait before publishing
 
 
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 # LEAF 1 & 6: OpenGripper
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 class OpenGripper(py_trees.behaviour.Behaviour):
     """
     Opens the gripper using MoveIt.
+    Called at start (before approach) and at end (after place).
 
     State machine:
-      idle → thread starts → RUNNING → thread done → SUCCESS/FAILURE
+      initialise() → start thread → update() returns RUNNING
+      thread done  → _status set  → update() returns SUCCESS/FAILURE
     """
 
     def __init__(self, name: str, node: Node, planner: MotionPlanner):
         super().__init__(name)
         self.node    = node
         self.planner = planner
-        self._status = None      # None=not started, True=success, False=failed
+        self._status = None
         self._thread = None
 
     def initialise(self):
-        """Called once when this leaf becomes active."""
-        self.node.get_logger().info(f'[{self.name}] initialise — opening gripper')
+        self.node.get_logger().info(f'[{self.name}] opening gripper')
         self._status = None
-
-        # Run MoveIt call in background thread so update() never blocks
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def _run(self):
-        """Background thread — does the actual MoveIt call."""
-        ok = self.planner.open_gripper()
-        self._status = ok   # True or False
+        self._status = self.planner.open_gripper()
 
     def update(self) -> py_trees.common.Status:
-        """Called every 0.1s tick."""
         if self._status is None:
-            return py_trees.common.Status.RUNNING   # still working
-
+            return py_trees.common.Status.RUNNING
         if self._status:
-            self.node.get_logger().info(f'[{self.name}] SUCCESS')
+            self.node.get_logger().info(f'[{self.name}] SUCCESS ✓')
             return py_trees.common.Status.SUCCESS
-        else:
-            self.node.get_logger().error(f'[{self.name}] FAILURE')
-            return py_trees.common.Status.FAILURE
+        self.node.get_logger().error(f'[{self.name}] FAILURE ✗')
+        return py_trees.common.Status.FAILURE
 
     def terminate(self, new_status):
-        """Called when leaf exits (success, failure, or interrupted)."""
         pass
 
 
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 # LEAF 2: Grabbing
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 class Grabbing(py_trees.behaviour.Behaviour):
     """
     Full grasp sequence:
-      1. Subscribe to /red_cup_pose — wait for a valid pose
-      2. Move to pre-grasp (above cup)
-      3. Move to grasp (at cup)
-      4. Close gripper
+      1. Wait for /red_cup_pose from perception node
+      2. Move to home (safe start)
+      3. Move above cup (gripper closed, safe transit)
+      4. Open gripper (when directly above cup)
+      5. Descend to cup rim height
+      6. Close gripper (grip the cup)
 
     State machine:
-      WAITING_FOR_POSE → MOVING → SUCCESS/FAILURE
+      WAITING_FOR_POSE → thread started → RUNNING → SUCCESS/FAILURE
     """
 
     def __init__(self, name: str, node: Node, planner: MotionPlanner):
@@ -129,116 +126,105 @@ class Grabbing(py_trees.behaviour.Behaviour):
         self.node    = node
         self.planner = planner
 
-        self._cup_pose  = None    # latest PoseStamped from /red_cup_pose
-        self._status    = None    # None=running, True=success, False=failed
-        self._thread    = None
-        self._started   = False
+        self._cup_pose = None   # latest PoseStamped from /red_cup_pose
+        self._status   = None
+        self._thread   = None
+        self._started  = False
 
-        # Subscribe to perception node output
+        # Subscribe to perception output
         self._sub = self.node.create_subscription(
-            PoseStamped,
-            '/red_cup_pose',
-            self._pose_cb,
-            10
+            PoseStamped, '/red_cup_pose', self._pose_cb, 10
         )
 
     def _pose_cb(self, msg: PoseStamped):
-        """Store latest cup pose — called from ROS spin thread."""
         self._cup_pose = msg
 
     def initialise(self):
-        """Called once when this leaf becomes active."""
-        self.node.get_logger().info(f'[{self.name}] initialise — waiting for cup pose')
+        self.node.get_logger().info(f'[{self.name}] waiting for cup pose')
         self._status  = None
         self._started = False
-        # Keep existing subscription — don't recreate
 
     def _run(self, cup_pose: PoseStamped):
-        """
-        Background thread — full grasp sequence.
-        cup_pose is a snapshot taken when thread starts.
-        """
         cx = cup_pose.pose.position.x
         cy = cup_pose.pose.position.y
         cz = cup_pose.pose.position.z
 
         self.node.get_logger().info(
-            f'[{self.name}] Cup at base_link: '
+            f'[{self.name}] cup at base_link: '
             f'x={cx:.3f} y={cy:.3f} z={cz:.3f}'
         )
 
-        # Step 1: move to pre-grasp (above cup)
-        self.node.get_logger().info(f'[{self.name}] Moving to pre-grasp')
-        ok = self.planner.move_to_xyz(cx, cy, cz + PRE_GRASP_Z_OFFSET)
-        if not ok:
-            self.node.get_logger().error(f'[{self.name}] Pre-grasp FAILED')
-            self._status = False
-            return
+        # 1. Safe home first
+        self.node.get_logger().info(f'[{self.name}] moving to home')
+        if not self.planner.move_to_named_target('start'):
+            self._status = False; return
 
-        # Step 2: descend to grasp height
-        self.node.get_logger().info(f'[{self.name}] Descending to grasp')
-        ok = self.planner.move_to_xyz(cx, cy, cz + GRASP_Z_OFFSET)
-        if not ok:
-            self.node.get_logger().error(f'[{self.name}] Grasp descent FAILED')
-            self._status = False
-            return
+        # 2. Close gripper before moving over scene
+        self.node.get_logger().info(f'[{self.name}] closing gripper for transit')
+        if not self.planner.close_gripper():
+            self._status = False; return
 
-        # Step 3: close gripper
-        self.node.get_logger().info(f'[{self.name}] Closing gripper')
-        ok = self.planner.close_gripper()
-        if not ok:
-            self.node.get_logger().error(f'[{self.name}] Close gripper FAILED')
-            self._status = False
-            return
+        # 3. Move above cup (safe height, gripper closed)
+        pre_z = max(cz + Z_PRE_GRASP, 0.22)
+        self.node.get_logger().info(f'[{self.name}] moving above cup z={pre_z:.3f}')
+        if not self.planner.move_to_xyz(cx, cy, pre_z):
+            self._status = False; return
+
+        # 4. Open gripper when directly above cup
+        self.node.get_logger().info(f'[{self.name}] opening gripper above cup')
+        if not self.planner.open_gripper():
+            self._status = False; return
+
+        # 5. Descend to grasp height
+        grasp_z = max(cz + Z_GRASP, 0.08)
+        self.node.get_logger().info(f'[{self.name}] descending to z={grasp_z:.3f}')
+        if not self.planner.move_to_xyz(cx, cy, grasp_z):
+            self._status = False; return
+
+        # 6. Close gripper to grip cup
+        self.node.get_logger().info(f'[{self.name}] closing gripper on cup')
+        if not self.planner.close_gripper():
+            self._status = False; return
 
         self._status = True
 
     def update(self) -> py_trees.common.Status:
-        """Called every 0.1s tick."""
-
-        # Wait until we have a cup pose
         if self._cup_pose is None:
             self.node.get_logger().info(
-                f'[{self.name}] Waiting for /red_cup_pose ...', throttle_duration_sec=2.0
+                f'[{self.name}] waiting for /red_cup_pose ...',
+                throttle_duration_sec=2.0
             )
             return py_trees.common.Status.RUNNING
 
-        # Start background thread once we have a pose
         if not self._started:
             self._started = True
-            # Take a snapshot of current pose for the thread
-            pose_snapshot = self._cup_pose
+            snapshot = self._cup_pose   # snapshot current pose
             self._thread = threading.Thread(
-                target=self._run, args=(pose_snapshot,), daemon=True
+                target=self._run, args=(snapshot,), daemon=True
             )
             self._thread.start()
 
-        # Check thread result
         if self._status is None:
             return py_trees.common.Status.RUNNING
-
         if self._status:
-            self.node.get_logger().info(f'[{self.name}] SUCCESS')
+            self.node.get_logger().info(f'[{self.name}] SUCCESS ✓')
             return py_trees.common.Status.SUCCESS
-        else:
-            self.node.get_logger().error(f'[{self.name}] FAILURE')
-            return py_trees.common.Status.FAILURE
+        self.node.get_logger().error(f'[{self.name}] FAILURE ✗')
+        return py_trees.common.Status.FAILURE
 
     def terminate(self, new_status):
         pass
 
 
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 # LEAF 4: MoveToBoxPosition
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 class MoveToBoxPosition(py_trees.behaviour.Behaviour):
     """
-    Move the grasped cup to the box and place it:
-      1. Lift straight up (safe transit height)
-      2. Move above box
-      3. Descend to place height
-
-    Box position is hardcoded from Isaac Sim scene.
+    Carry cup from grasp position to bin and place it:
+      1. Lift straight up (stay at cup x,y to avoid sweeping)
+      2. Transit horizontally to above bin
+      3. Descend into bin
     """
 
     def __init__(self, name: str, node: Node, planner: MotionPlanner):
@@ -249,73 +235,74 @@ class MoveToBoxPosition(py_trees.behaviour.Behaviour):
         self._thread = None
 
     def initialise(self):
-        """Called once when this leaf becomes active."""
-        self.node.get_logger().info(f'[{self.name}] initialise — moving to box')
+        self.node.get_logger().info(f'[{self.name}] starting place sequence')
         self._status = None
-
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def _run(self):
-        """Background thread — full place sequence."""
+        # # 1. Lift straight up
+        # self.node.get_logger().info(f'[{self.name}] lifting to z={Z_LIFT:.3f}')
+        # if not self.planner.move_to_xyz(BIN_X, BIN_Y, Z_LIFT,
+        #                                  constrain_orientation=False):
+        #     self.node.get_logger().warn(f'[{self.name}] lift failed — attempting recovery')
+        #     self.planner.move_to_named_target('start')
+        #     self._status = False; return
+            
+        # Step 1: lift straight UP from current position (cup x,y)
+        # Use named target 'start' as intermediate safe position
+        self.node.get_logger().info(f'[{self.name}] moving to safe home first')
+        if not self.planner.move_to_named_target('start'):
+            self._status = False; return
 
-        # Step 1: lift straight up from grasp position
-        self.node.get_logger().info(f'[{self.name}] Lifting up')
-        ok = self.planner.move_to_xyz(
-            BOX_X, BOX_Y, BOX_Z + PRE_PLACE_Z_OFFSET + 0.10
+        # 2. Transit to above bin
+        self.node.get_logger().info(
+            f'[{self.name}] transit to bin x={BIN_X:.3f} y={BIN_Y:.3f} '
+            f'z={Z_TRANSIT:.3f}'
         )
-        # If lift fails try going home first as recovery
-        if not ok:
-            self.node.get_logger().warn(f'[{self.name}] Lift failed — trying home')
-            self.planner.move_to_named_target('start')
-            self._status = False
-            return
+        if not self.planner.move_to_xyz(BIN_X, BIN_Y, Z_TRANSIT,
+                                         constrain_orientation=False):
+            self._status = False; return
 
-        # Step 2: move above box
-        self.node.get_logger().info(f'[{self.name}] Moving above box')
-        ok = self.planner.move_to_xyz(BOX_X, BOX_Y, BOX_Z + PRE_PLACE_Z_OFFSET)
-        if not ok:
-            self.node.get_logger().error(f'[{self.name}] Move above box FAILED')
-            self._status = False
-            return
-
-        # Step 3: descend to place height
-        self.node.get_logger().info(f'[{self.name}] Descending to place')
-        ok = self.planner.move_to_xyz(BOX_X, BOX_Y, BOX_Z + PLACE_Z_OFFSET)
-        if not ok:
-            self.node.get_logger().error(f'[{self.name}] Place descent FAILED')
-            self._status = False
-            return
-
+        # 3. Descend into bin
+        self.node.get_logger().info(f'[{self.name}] descending to z={Z_PLACE:.3f}')
+        if not self.planner.move_to_xyz(BIN_X, BIN_Y, Z_PLACE,
+                                         constrain_orientation=False):
+            self._status = False; return
+            # Wait for arm to fully stop before detach
+        time.sleep(1.0)   # ← ADD THIS
         self._status = True
 
     def update(self) -> py_trees.common.Status:
-        """Called every 0.1s tick."""
         if self._status is None:
             return py_trees.common.Status.RUNNING
-
         if self._status:
-            self.node.get_logger().info(f'[{self.name}] SUCCESS')
+            self.node.get_logger().info(f'[{self.name}] SUCCESS ✓')
             return py_trees.common.Status.SUCCESS
-        else:
-            self.node.get_logger().error(f'[{self.name}] FAILURE')
-            return py_trees.common.Status.FAILURE
+        self.node.get_logger().error(f'[{self.name}] FAILURE ✗')
+        return py_trees.common.Status.FAILURE
 
     def terminate(self, new_status):
         pass
 
 
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 # PROVIDED: AttachDetachCube (unchanged from template)
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 class AttachDetachCube(py_trees.behaviour.Behaviour):
+    """
+    Publishes a Bool to /isaac_attach_cube after a short delay.
+    attach=True  → Isaac OmniGraph creates FixedJoint (cup sticks to jaw)
+    attach=False → Isaac OmniGraph removes FixedJoint (cup released)
+    """
+
     def __init__(self, name, node, topic_name, attach, delay_sec=1.0):
         super().__init__(name)
-        self.node       = node
-        self.topic_name = topic_name
-        self.attach     = attach
-        self.delay_sec  = delay_sec
-        self.pub        = self.node.create_publisher(Bool, topic_name, 10)
+        self.node        = node
+        self.topic_name  = topic_name
+        self.attach      = attach
+        self.delay_sec   = delay_sec
+        self.pub         = self.node.create_publisher(Bool, topic_name, 10)
         self._start_time = None
         self._done       = False
 
@@ -330,31 +317,34 @@ class AttachDetachCube(py_trees.behaviour.Behaviour):
             msg.data = self.attach
             self.pub.publish(msg)
             self.node.get_logger().info(
-                f'BT: Isaac attach={self.attach} on {self.topic_name}'
+                f"BT: Isaac attach={self.attach} → {self.topic_name}"
             )
             self._done = True
             return py_trees.common.Status.SUCCESS
         return py_trees.common.Status.RUNNING
 
+    def terminate(self, new_status):
+        pass
 
-# ═════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────
 # TREE BUILDER
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 def create_tree(node: Node, planner: MotionPlanner):
     """
-    Build the full behaviour tree.
+    Build the full pick-and-place behaviour tree.
 
     Structure:
-      OneShot
-        └── Sequence (memory=True — remembers which steps completed)
-              ├── Retry → OpenGripper
-              ├── Retry → Grabbing
-              ├── AttachCube          ← PROVIDED
-              ├── Retry → MoveToBoxPosition
-              ├── DetachCube          ← PROVIDED
-              └── Retry → OpenGripper
+      OneShot (run once then stop)
+        └── Sequence (memory=True)
+              ├── Retry → OpenGripper       ← open before approach
+              ├── Retry → Grabbing          ← detect + grasp
+              ├── AttachCube                ← PROVIDED
+              ├── Retry → MoveToBoxPosition ← carry + place
+              ├── DetachCube                ← PROVIDED
+              └── Retry → OpenGripper       ← release
     """
-    STEP_RETRIES = 2
+    RETRIES = 2
 
     seq = py_trees.composites.Sequence(name="PickAndPlace", memory=True)
 
@@ -362,12 +352,12 @@ def create_tree(node: Node, planner: MotionPlanner):
         py_trees.decorators.Retry(
             name="RetryOpenGripper1",
             child=OpenGripper("OpenGripper1", node, planner),
-            num_failures=STEP_RETRIES,
+            num_failures=RETRIES,
         ),
         py_trees.decorators.Retry(
             name="RetryGrabbing",
             child=Grabbing("Grabbing", node, planner),
-            num_failures=STEP_RETRIES,
+            num_failures=RETRIES,
         ),
         # PROVIDED — attaches cup to gripper jaw in Isaac Sim
         AttachDetachCube(
@@ -377,7 +367,7 @@ def create_tree(node: Node, planner: MotionPlanner):
         py_trees.decorators.Retry(
             name="RetryMoveToBox",
             child=MoveToBoxPosition("MoveToBoxPosition", node, planner),
-            num_failures=STEP_RETRIES,
+            num_failures=RETRIES,
         ),
         # PROVIDED — releases cup from gripper jaw in Isaac Sim
         AttachDetachCube(
@@ -387,52 +377,54 @@ def create_tree(node: Node, planner: MotionPlanner):
         py_trees.decorators.Retry(
             name="RetryOpenGripper2",
             child=OpenGripper("OpenGripper2", node, planner),
-            num_failures=STEP_RETRIES,
+            num_failures=RETRIES,
         ),
     ])
 
-    # OneShot — run the sequence once then stop
     root = py_trees.decorators.OneShot(
         name="RunOnce",
         child=seq,
         policy=py_trees.common.OneShotPolicy.ON_COMPLETION,
     )
-
     return root
 
 
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 # BT NODE
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 class BTNode(Node):
     """
-    Main ROS 2 node that owns the BehaviourTree and ticks it.
-
-    The MotionPlanner is created here and passed to all BT leaves
-    so they share the same MoveIt action client.
+    Main ROS 2 node. Creates the MotionPlanner, builds the BehaviourTree,
+    and ticks it every 0.1s via a timer.
     """
 
     def __init__(self):
-        super().__init__('so101_bt_node')
+        super().__init__('bt_node')
 
-        # Create motion planner — shared by all BT leaves
+        # Motion planner — shared by all BT leaves
         self.planner = MotionPlanner()
 
-        # Build tree
+        # Build and display tree structure
         self.tree = py_trees.trees.BehaviourTree(
             create_tree(self, self.planner)
         )
+        self.get_logger().info(
+            '=== Behaviour Tree starting ===\n' +
+            py_trees.display.ascii_tree(self.tree.root)
+        )
 
-        # Tick every 0.1 seconds
+        # Tick every 0.1s
         self.timer = self.create_timer(0.1, self._tick)
-
-        self.get_logger().info('SO101 BT node started — ticking every 0.1s')
 
     def _tick(self):
         self.tree.tick()
-        # Print tree status every 10 ticks (1 second)
-        # Uncomment below for verbose debugging:
-        # print(py_trees.display.ascii_tree(self.tree.root))
+        # Check if tree has finished
+        if self.tree.root.status == py_trees.common.Status.SUCCESS:
+            self.get_logger().info('=== Pick-and-place COMPLETE ✓ ===')
+            self.timer.cancel()
+        elif self.tree.root.status == py_trees.common.Status.FAILURE:
+            self.get_logger().error('=== Pick-and-place FAILED ✗ ===')
+            self.timer.cancel()
 
 
 def main():
@@ -449,229 +441,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# #!/usr/bin/env python3
-# """
-# INTERVIEW TEMPLATE: ROS2 + py_trees Behaviour Tree (Implementation-Agnostic)
-
-# Task sequence:
-# 1) open_gripper
-# 2) grabbing
-# 3) attach (simulation)        <-- PROVIDED (from our side)
-# 4) move_to_box_position
-# 5) detach (simulation)        <-- PROVIDED (from our side)
-# 6) open_gripper
-
-# Instructions:
-# - Implement ONLY the TODO logic in OpenGripper / Grabbing / MoveToBoxPosition.
-# - You can use ANY ROS approach you want (services/actions/topics/MoveIt/etc.).
-# - Each leaf must return proper py_trees status: RUNNING / SUCCESS / FAILURE.
-# - Do not block inside update() (no sleep). Use state/futures/timers if needed.
-# """
-
-# #!/usr/bin/env python3
-# import time
-# import rclpy
-# from rclpy.node import Node
-# import py_trees
-# from std_msgs.msg import Bool
-
-
-# # -------------------------
-# # Candidate BT Leaves (blank)
-# # -------------------------
-# class OpenGripper(py_trees.behaviour.Behaviour):
-#     def __init__(self, name: str, node: Node):
-#         super().__init__(name)
-#         self.node = node
-#         # TODO: initialise any clients/publishers/actions you want here
-#         # self.some_client = ...
-
-#     def initialise(self):
-#         # TODO: reset internal state (futures/flags/timers) if needed
-#         pass
-
-#     def update(self) -> py_trees.common.Status:
-#         # TODO: implement open gripper
-#         # Return RUNNING until done, then SUCCESS/FAILURE
-#         return py_trees.common.Status.FAILURE
-
-
-# class Grabbing(py_trees.behaviour.Behaviour):
-#     def __init__(self, name: str, node: Node):
-#         super().__init__(name)
-#         self.node = node
-#         # TODO: initialise any clients/publishers/actions you want here
-
-#     def initialise(self):
-#         # TODO: reset internal state
-#         pass
-
-#     def update(self) -> py_trees.common.Status:
-#         # TODO: implement grabbing logic
-#         return py_trees.common.Status.FAILURE
-
-
-# class MoveToBoxPosition(py_trees.behaviour.Behaviour):
-#     def __init__(self, name: str, node: Node):
-#         super().__init__(name)
-#         self.node = node
-#         # TODO: initialise any clients/publishers/actions 
-#     def initialise(self):
-#         # TODO: reset internal state
-#         pass
-
-#     def update(self) -> py_trees.common.Status:
-#         # TODO: implement move to box position
-#         return py_trees.common.Status.FAILURE
-
-
-# # -------------------------
-# # PROVIDED: Attach / Detach Cube BT Leaf 
-# # -------------------------
-# class AttachDetachCube(py_trees.behaviour.Behaviour):
-#     def __init__(self, name, node, topic_name, attach, delay_sec=1.0):
-#         super().__init__(name)
-#         self.node = node
-#         self.topic_name = topic_name
-#         self.attach = attach
-#         self.delay_sec = delay_sec
-
-#         self.pub = self.node.create_publisher(Bool, topic_name, 10)
-#         self._start_time = None
-#         self._done = False
-
-#     def initialise(self):
-#         self._start_time = time.monotonic()
-#         self._done = False
-
-#     def update(self):
-#         if not self._done and (time.monotonic() - self._start_time) >= self.delay_sec:
-#             msg = Bool()
-#             msg.data = self.attach
-#             self.pub.publish(msg)
-#             self.node.get_logger().info(
-#                 f"BT: Isaac attach={self.attach} on {self.topic_name}"
-#             )
-#             self._done = True
-#             return py_trees.common.Status.SUCCESS
-
-#         return py_trees.common.Status.RUNNING
-
-
-# # -------------------------
-# # Tree
-# # -------------------------
-# def create_tree(node: Node):
-#     STEP_RETRIES = 2  # optional retry per-step (kept simple)
-#     ATTACH_TOPIC = "/robot/isaac_attach_cube"
-#     ATTACH_DELAY = 0.5
-
-#     seq = py_trees.composites.Sequence(name="TaskSequence", memory=True)
-
-#     seq.add_children([
-#         py_trees.decorators.Retry(
-#             "RetryOpen1",
-#             OpenGripper("OpenGripper1", node),
-#             STEP_RETRIES,
-#         ),
-#         py_trees.decorators.Retry(
-#             "RetryGrabbing",
-#             Grabbing("Grabbing", node),
-#             STEP_RETRIES,
-#         ),
-
-#         # PROVIDED
-#         AttachDetachCube("AttachCube", node, ATTACH_TOPIC, attach=True, delay_sec=ATTACH_DELAY),
-
-#         py_trees.decorators.Retry(
-#             "RetryMoveToBox",
-#             MoveToBoxPosition("MoveToBoxPosition", node),
-#             STEP_RETRIES,
-#         ),
-
-#         # PROVIDED
-#         AttachDetachCube("DetachCube", node, ATTACH_TOPIC, attach=False, delay_sec=ATTACH_DELAY),
-
-#         py_trees.decorators.Retry(
-#             "RetryOpen2",
-#             OpenGripper("OpenGripper2", node),
-#             STEP_RETRIES,
-#         ),
-#     ])
-
-#     # Run once (optional, keeps it from repeating forever)
-#     root = py_trees.decorators.OneShot(
-#         name="RunOnce",
-#         child=seq,
-#         policy=py_trees.common.OneShotPolicy.ON_COMPLETION
-#     )
-
-#     return root
-
-
-# # -------------------------
-# # Node
-# # -------------------------
-# class BTNode(Node):
-#     def __init__(self):
-#         super().__init__("bt_interview_template_node")
-
-#         self.tree = py_trees.trees.BehaviourTree(create_tree(self))
-#         self.timer = self.create_timer(0.1, self._tick)
-
-#         self.get_logger().info("Interview BT template node started.")
-
-#     def _tick(self):
-#         self.tree.tick()
-
-
-# def main():
-#     rclpy.init()
-#     node = BTNode()
-#     try:
-#         rclpy.spin(node)
-#     except KeyboardInterrupt:
-#         pass
-#     finally:
-#         node.destroy_node()
-#         rclpy.shutdown()
-
-
-# if __name__ == "__main__":
-#     main()
