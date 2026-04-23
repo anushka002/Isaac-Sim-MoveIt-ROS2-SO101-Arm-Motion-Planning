@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'so101_state_machine'
+package_name = 'so101_motion_planning'
 
 setup(
     name=package_name,
@@ -13,8 +13,8 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='test',
-    maintainer_email='test@fireloop.com',
+    maintainer='harsh',
+    maintainer_email='harshofficial008@gmail.com',
     description='TODO: Package description',
     license='TODO: License declaration',
     extras_require={
@@ -24,8 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'bt_node = so101_state_machine.bt_node:main',
-            'perception_node = so101_state_machine.perception_node:main'
+            'motion_planning_node = so101_motion_planning.motion_planning_node:main'
         ],
     },
 )
